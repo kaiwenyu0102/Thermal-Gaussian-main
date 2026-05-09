@@ -352,10 +352,10 @@ pip install .
 python convert.py -s <source_path>
 
 # convert.py 会自动执行:
-#   1. feature_extractor   → SIFT 特征提取
+#   1. feature_extractor    → SIFT 特征提取
 #   2. exhaustive_matcher   → 特征匹配
-#   3. mapper              → SfM 重建 (位姿 + 点云)
-#   4. image_undistorter   → 去畸变
+#   3. mapper               → SfM 重建 (位姿 + 点云)
+#   4. image_undistorter    → 去畸变
 
 # Step 3: 整理图像目录
 # 将去畸变后的图像分别放入 rgb/train, rgb/test, thermal/train, thermal/test
