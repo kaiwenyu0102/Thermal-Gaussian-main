@@ -56,15 +56,12 @@ class PUFTConfig:
         # --- 不确定性相关 ---
         self.uncertainty_lr = 0.005          # 不确定性学习率
         self.temperature_lr = 0.01           # 温度学习率
-        self.uncertainty_reg_weight = 0.05   # 不确定性正则权重(增大防止退化)
-        self.uncertainty_split_threshold = 1.5  # 不确定性触发分裂的阈值
+        self.uncertainty_reg_weight = 0.05   # 不确定性正则权重
         
         # --- 物理约束相关 ---
-        self.lambda_smooth = 0.01            # 温度平滑损失权重
+        self.lambda_smooth = 0.005           # 温度TV平滑权重（图像空间）
         self.lambda_range = 0.001            # 温度范围损失权重
         self.lambda_color_consist = 0.05     # 温度-颜色一致性权重
-        self.K_neighbors = 8                 # KNN邻居数
-        self.knn_update_interval = 1000      # KNN更新间隔
         
         # --- 温度范围（根据数据集调整）---
         self.T_min = 0.0                     # 最低温度 (°C)
@@ -72,7 +69,6 @@ class PUFTConfig:
         
         # --- 训练策略 ---
         self.smoothness_weight = 0.6         # 原始MFTG的smoothness_loss权重
-        self.densify_until_phase = "2b"      # 在哪个phase停止densification
         self.max_gaussians = 150000          # 最大高斯数（防止显存爆炸）
     
     @property
@@ -89,8 +85,7 @@ class PUFTConfig:
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, 
-             checkpoint_iterations, checkpoint, debug_from, step, puft_cfg=None,
-             train_device="cuda:0", physics_device=None):
+             checkpoint_iterations, checkpoint, debug_from, step, puft_cfg=None):
     """
     训练函数
     step=1: RGB训练（与原始MFTG相同）
@@ -123,14 +118,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         # 初始化PUFT属性
         gaussians.init_puft_attributes(T_min=puft_cfg.T_min, T_max=puft_cfg.T_max)
         
-        # 初始化物理约束模块
+        # 初始化物理约束模块（v3: 图像空间，无KNN）
         physics = PhysicsConstraints(
             T_min=puft_cfg.T_min,
-            T_max=puft_cfg.T_max,
-            K_neighbors=puft_cfg.K_neighbors,
-            update_interval=puft_cfg.knn_update_interval,
-            train_device=train_device,
-            compute_device=physics_device
+            T_max=puft_cfg.T_max
         )
     
     gaussians.training_setup(opt)
@@ -140,7 +131,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device=train_device)
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
@@ -226,7 +217,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                 loss = loss_ua + puft_cfg.smoothness_weight * smoothloss_thermal
                 
             elif iteration <= phase2b_end:
-                # === Phase 2b: 引入物理约束 + 不确定性引导的densification ===
+                # === Phase 2b: 引入图像空间物理约束 ===
                 loss_ua = uncertainty_aware_loss(
                     pixel_loss_map, uncertainty_map,
                     reg_weight=puft_cfg.uncertainty_reg_weight
@@ -237,25 +228,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                 progress_in_2b = (iteration - phase2a_end) / (phase2b_end - phase2a_end)
                 warmup = min(progress_in_2b, 1.0)
                 
-                # 更新KNN（周期性）
-                if iteration % puft_cfg.knn_update_interval == 0:
-                    physics.update_knn(gaussians.get_xyz.detach())
+                # 渲染温度图（图像空间物理约束）
+                T_map = render_temperature_map(viewpoint_cam, gaussians, pipe, bg, render)
                 
-                # 温度平滑损失
-                loss_smooth = physics.temperature_smoothness_loss(
-                    gaussians.get_temperature,
-                    gaussians.get_xyz,
-                    gaussians.get_uncertainty
-                )
+                # 图像空间温度平滑 (TV loss, uncertainty-weighted)
+                loss_smooth = physics.temperature_smoothness_loss(T_map, uncertainty_map)
                 
-                # 温度范围损失
+                # 温度范围约束 (per-Gaussian)
                 loss_range = physics.temperature_range_loss(gaussians.get_temperature)
                 
                 # 温度-颜色一致性
-                T_map = render_temperature_map(viewpoint_cam, gaussians, pipe, bg, render)
-                loss_color_consist = physics.temperature_color_consistency_loss(
-                    T_map, image
-                )
+                loss_color_consist = physics.temperature_color_consistency_loss(T_map, gt_image)
                 
                 loss = (loss_ua 
                         + puft_cfg.smoothness_weight * smoothloss_thermal
@@ -271,12 +254,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                 )
                 smoothloss_thermal = smoothness_loss(image)
                 
-                # 物理约束全力施加
-                loss_smooth = physics.temperature_smoothness_loss(
-                    gaussians.get_temperature,
-                    gaussians.get_xyz,
-                    gaussians.get_uncertainty
-                )
+                # 温度图约束（全强度）
+                T_map = render_temperature_map(viewpoint_cam, gaussians, pipe, bg, render)
+                loss_smooth = physics.temperature_smoothness_loss(T_map, uncertainty_map)
                 loss_range = physics.temperature_range_loss(gaussians.get_temperature)
                 
                 loss = (loss_ua
@@ -333,23 +313,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                         gaussians.reset_opacity()
             
             elif step == 2:
-                # Stage 2: PUFT不确定性引导的densification（仅在Phase 2b）
-                phase2a_end_iter = puft_cfg.phase2a_iters
-                phase2b_end_iter = puft_cfg.phase2a_iters + puft_cfg.phase2b_iters
-                
-                if phase2a_end_iter < iteration <= phase2b_end_iter:
-                    # Phase 2b: 启用不确定性引导的densification
-                    if iteration < opt.densify_until_iter:
-                        gaussians.max_radii2D[visibility_filter] = torch.max(
-                            gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                        gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                # Stage 2: 标准densification（无不确定性引导，受max_gaussians限制）
+                # 只在前15000步做densification，之后固定点数精炼
+                if iteration < min(opt.densify_until_iter, 15000):
+                    gaussians.max_radii2D[visibility_filter] = torch.max(
+                        gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                        if iteration % opt.densification_interval == 0:
-                            size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                            gaussians.densify_and_prune(
-                                opt.densify_grad_threshold, 0.005, 
-                                scene.cameras_extent, size_threshold,
-                                max_gaussians=puft_cfg.max_gaussians)
+                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        gaussians.densify_and_prune(
+                            opt.densify_grad_threshold, 0.005, 
+                            scene.cameras_extent, size_threshold,
+                            max_gaussians=puft_cfg.max_gaussians)
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -467,21 +443,15 @@ if __name__ == "__main__":
     # === PUFT 专用参数 ===
     parser.add_argument("--puft_T_min", type=float, default=0.0, help="Scene minimum temperature (°C)")
     parser.add_argument("--puft_T_max", type=float, default=100.0, help="Scene maximum temperature (°C)")
-    parser.add_argument("--puft_lambda_smooth", type=float, default=0.01, help="Temperature smoothness loss weight")
+    parser.add_argument("--puft_lambda_smooth", type=float, default=0.005, help="Temperature TV smoothness weight (image-space)")
     parser.add_argument("--puft_lambda_range", type=float, default=0.001, help="Temperature range loss weight")
     parser.add_argument("--puft_lambda_color", type=float, default=0.05, help="Temperature-color consistency weight")
     parser.add_argument("--puft_uncertainty_lr", type=float, default=0.005, help="Uncertainty learning rate")
     parser.add_argument("--puft_temperature_lr", type=float, default=0.01, help="Temperature learning rate")
-    parser.add_argument("--puft_uncertainty_reg", type=float, default=0.05, help="Uncertainty regularization weight (increased to prevent degenerate solutions)")
-    parser.add_argument("--puft_K_neighbors", type=int, default=8, help="KNN neighbors for temperature smoothness")
+    parser.add_argument("--puft_uncertainty_reg", type=float, default=0.05, help="Uncertainty regularization weight")
     parser.add_argument("--puft_phase2a_ratio", type=float, default=0.15, help="Phase 2a ratio in Stage 2")
     parser.add_argument("--puft_phase2b_ratio", type=float, default=0.55, help="Phase 2b ratio in Stage 2")
     parser.add_argument("--puft_max_gaussians", type=int, default=150000, help="Maximum number of Gaussians (prevents OOM)")
-    
-    # === 双GPU配置 ===
-    parser.add_argument("--train_device", type=str, default="cuda:0", help="Main training device (default: cuda:0)")
-    parser.add_argument("--physics_device", type=str, default=None, 
-                        help="Device for physics/KNN computation (default: auto-select cuda:1 if available, else cpu)")
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -494,14 +464,12 @@ if __name__ == "__main__":
     puft_cfg.lambda_range = args.puft_lambda_range
     puft_cfg.lambda_color_consist = args.puft_lambda_color
     puft_cfg.uncertainty_reg_weight = args.puft_uncertainty_reg
-    puft_cfg.K_neighbors = args.puft_K_neighbors
     puft_cfg.phase2a_ratio = args.puft_phase2a_ratio
     puft_cfg.phase2b_ratio = args.puft_phase2b_ratio
     puft_cfg.stage2_iterations = args.iterations
     puft_cfg.max_gaussians = args.puft_max_gaussians
     
     # 将PUFT学习率传递给OptimizationParams
-    # 通过动态添加属性实现
     opt_args = op.extract(args)
     opt_args.uncertainty_lr = args.puft_uncertainty_lr
     opt_args.temperature_lr = args.puft_temperature_lr
@@ -527,16 +495,14 @@ if __name__ == "__main__":
     # Stage 1: RGB training (same as MFTG)
     training(lp.extract(args), op.extract(args), pp.extract(args), 
              args.test_iterations, args.save_iterations, args.checkpoint_iterations, 
-             args.start_checkpoint, args.debug_from, step=1, puft_cfg=puft_cfg,
-             train_device=args.train_device, physics_device=args.physics_device)
+             args.start_checkpoint, args.debug_from, step=1, puft_cfg=puft_cfg)
     
     print(f"\033[1;97m●\033[0m Color training complete, preparing PUFT thermal fine-tuning...")
     
     # Stage 2: PUFT thermal fine-tuning
     training(lp.extract(args), opt_args, pp.extract(args),
              args.test_iterations, args.save_iterations, args.checkpoint_iterations,
-             args.start_checkpoint, args.debug_from, step=2, puft_cfg=puft_cfg,
-             train_device=args.train_device, physics_device=args.physics_device)
+             args.start_checkpoint, args.debug_from, step=2, puft_cfg=puft_cfg)
 
     # All done
     print(f"\033[1;32m●\033[0m PUFT Training complete.")

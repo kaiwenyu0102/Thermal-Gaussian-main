@@ -422,17 +422,7 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
-        # === PUFT: 不确定性引导的额外分裂条件 ===
-        if self.puft_enabled and isinstance(self._uncertainty, nn.Parameter):
-            uncertainty_vals = self.get_uncertainty.squeeze()
-            # 使用相对阈值: 均值 + 2倍标准差 (只分裂真正异常的高不确定性点)
-            sigma_mean = uncertainty_vals.mean()
-            sigma_std = uncertainty_vals.std()
-            adaptive_threshold = max(sigma_mean + 2.0 * sigma_std, 3.0)  # 至少3.0
-            high_uncertainty_mask = uncertainty_vals > adaptive_threshold
-            big_enough_mask = torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent
-            uncertainty_split_mask = torch.logical_and(high_uncertainty_mask, big_enough_mask)
-            selected_pts_mask = torch.logical_or(selected_pts_mask, uncertainty_split_mask)
+        # === PUFT: 保持标准densification逻辑，不额外触发分裂 ===
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -464,17 +454,7 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
-        # === PUFT: 不确定性引导的额外克隆条件 ===
-        if self.puft_enabled and isinstance(self._uncertainty, nn.Parameter):
-            uncertainty_vals = self.get_uncertainty.squeeze()
-            # 使用相对阈值: 均值 + 2倍标准差
-            sigma_mean = uncertainty_vals.mean()
-            sigma_std = uncertainty_vals.std()
-            adaptive_threshold = max(sigma_mean + 2.0 * sigma_std, 3.0)
-            high_uncertainty_mask = uncertainty_vals > adaptive_threshold
-            small_enough_mask = torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent
-            uncertainty_clone_mask = torch.logical_and(high_uncertainty_mask, small_enough_mask)
-            selected_pts_mask = torch.logical_or(selected_pts_mask, uncertainty_clone_mask)
+        # === PUFT: 保持标准densification逻辑，不额外触发克隆 ===
 
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
