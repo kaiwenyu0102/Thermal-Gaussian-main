@@ -34,7 +34,7 @@ except ImportError:
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, step):
-    logging.info(f"\u25CB dataset:{dataset.name}, opt:{opt}, pipe:{pipe}, step:{step}, debug_from:{debug_from}, set:{step}\n")
+    logging.info(f"\u25CB dataset:{dataset.source_path}, opt:{opt}, pipe:{pipe}, step:{step}, debug_from:{debug_from}, set:{step}\n")
     
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)

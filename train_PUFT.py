@@ -94,7 +94,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
     step=1: RGB训练（与原始MFTG相同）
     step=2: PUFT热图像微调
     """
-    logging.info(f"○ dataset:{dataset.name}, opt:{opt}, pipe:{pipe}, step:{step}, debug_from:{debug_from}\n")
+    logging.info(f"○ dataset:{dataset.source_path}, opt:{opt}, pipe:{pipe}, step:{step}, debug_from:{debug_from}\n")
     
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
