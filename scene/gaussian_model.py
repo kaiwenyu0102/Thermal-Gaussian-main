@@ -425,8 +425,11 @@ class GaussianModel:
         # === PUFT: 不确定性引导的额外分裂条件 ===
         if self.puft_enabled and isinstance(self._uncertainty, nn.Parameter):
             uncertainty_vals = self.get_uncertainty.squeeze()
-            # 高不确定性+大尺度的高斯也应该被分裂
-            high_uncertainty_mask = uncertainty_vals > 1.5  # 阈值可调
+            # 使用相对阈值: 均值 + 2倍标准差 (只分裂真正异常的高不确定性点)
+            sigma_mean = uncertainty_vals.mean()
+            sigma_std = uncertainty_vals.std()
+            adaptive_threshold = max(sigma_mean + 2.0 * sigma_std, 3.0)  # 至少3.0
+            high_uncertainty_mask = uncertainty_vals > adaptive_threshold
             big_enough_mask = torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent
             uncertainty_split_mask = torch.logical_and(high_uncertainty_mask, big_enough_mask)
             selected_pts_mask = torch.logical_or(selected_pts_mask, uncertainty_split_mask)
@@ -464,8 +467,11 @@ class GaussianModel:
         # === PUFT: 不确定性引导的额外克隆条件 ===
         if self.puft_enabled and isinstance(self._uncertainty, nn.Parameter):
             uncertainty_vals = self.get_uncertainty.squeeze()
-            # 高不确定性+小尺度的高斯应该被克隆
-            high_uncertainty_mask = uncertainty_vals > 1.5
+            # 使用相对阈值: 均值 + 2倍标准差
+            sigma_mean = uncertainty_vals.mean()
+            sigma_std = uncertainty_vals.std()
+            adaptive_threshold = max(sigma_mean + 2.0 * sigma_std, 3.0)
+            high_uncertainty_mask = uncertainty_vals > adaptive_threshold
             small_enough_mask = torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent
             uncertainty_clone_mask = torch.logical_and(high_uncertainty_mask, small_enough_mask)
             selected_pts_mask = torch.logical_or(selected_pts_mask, uncertainty_clone_mask)
@@ -486,12 +492,17 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_uncertainty, new_temperature)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, max_gaussians=200000):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        # 如果已超过最大点数限制，跳过densification只做pruning
+        current_n = self.get_xyz.shape[0]
+        if current_n < max_gaussians:
+            self.densify_and_clone(grads, max_grad, extent)
+            self.densify_and_split(grads, max_grad, extent)
+        else:
+            print(f"[PUFT] Skipping densification: {current_n} >= {max_gaussians} (max)")
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:

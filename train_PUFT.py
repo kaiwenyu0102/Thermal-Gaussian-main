@@ -56,7 +56,7 @@ class PUFTConfig:
         # --- 不确定性相关 ---
         self.uncertainty_lr = 0.005          # 不确定性学习率
         self.temperature_lr = 0.01           # 温度学习率
-        self.uncertainty_reg_weight = 0.01   # 不确定性稀疏正则权重
+        self.uncertainty_reg_weight = 0.05   # 不确定性正则权重(增大防止退化)
         self.uncertainty_split_threshold = 1.5  # 不确定性触发分裂的阈值
         
         # --- 物理约束相关 ---
@@ -73,6 +73,7 @@ class PUFTConfig:
         # --- 训练策略 ---
         self.smoothness_weight = 0.6         # 原始MFTG的smoothness_loss权重
         self.densify_until_phase = "2b"      # 在哪个phase停止densification
+        self.max_gaussians = 150000          # 最大高斯数（防止显存爆炸）
     
     @property
     def phase2a_iters(self):
@@ -347,7 +348,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                             size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                             gaussians.densify_and_prune(
                                 opt.densify_grad_threshold, 0.005, 
-                                scene.cameras_extent, size_threshold)
+                                scene.cameras_extent, size_threshold,
+                                max_gaussians=puft_cfg.max_gaussians)
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -470,10 +472,11 @@ if __name__ == "__main__":
     parser.add_argument("--puft_lambda_color", type=float, default=0.05, help="Temperature-color consistency weight")
     parser.add_argument("--puft_uncertainty_lr", type=float, default=0.005, help="Uncertainty learning rate")
     parser.add_argument("--puft_temperature_lr", type=float, default=0.01, help="Temperature learning rate")
-    parser.add_argument("--puft_uncertainty_reg", type=float, default=0.01, help="Uncertainty regularization weight")
+    parser.add_argument("--puft_uncertainty_reg", type=float, default=0.05, help="Uncertainty regularization weight (increased to prevent degenerate solutions)")
     parser.add_argument("--puft_K_neighbors", type=int, default=8, help="KNN neighbors for temperature smoothness")
     parser.add_argument("--puft_phase2a_ratio", type=float, default=0.15, help="Phase 2a ratio in Stage 2")
     parser.add_argument("--puft_phase2b_ratio", type=float, default=0.55, help="Phase 2b ratio in Stage 2")
+    parser.add_argument("--puft_max_gaussians", type=int, default=150000, help="Maximum number of Gaussians (prevents OOM)")
     
     # === 双GPU配置 ===
     parser.add_argument("--train_device", type=str, default="cuda:0", help="Main training device (default: cuda:0)")
@@ -495,6 +498,7 @@ if __name__ == "__main__":
     puft_cfg.phase2a_ratio = args.puft_phase2a_ratio
     puft_cfg.phase2b_ratio = args.puft_phase2b_ratio
     puft_cfg.stage2_iterations = args.iterations
+    puft_cfg.max_gaussians = args.puft_max_gaussians
     
     # 将PUFT学习率传递给OptimizationParams
     # 通过动态添加属性实现

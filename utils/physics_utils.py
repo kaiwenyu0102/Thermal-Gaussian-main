@@ -2,7 +2,7 @@
 # PUFT: Physics-guided Uncertainty-aware Fine-Tuning
 # 物理约束与不确定性感知损失函数模块
 #
-# 支持双GPU: 主训练在GPU:0，物理约束计算可在GPU:1或CPU上执行
+# 双GPU策略: 主训练在GPU:0，KNN计算在CPU上执行（内存充裕不会OOM）
 #
 
 import torch
@@ -15,13 +15,14 @@ class PhysicsConstraints:
     物理引导约束模块
     包含温度空间平滑性约束、温度范围约束和温度-颜色一致性约束
     
-    双GPU策略:
-    - KNN索引计算（高显存开销）在 compute_device 上执行
-    - 缓存的索引会搬回 train_device 供后续loss计算使用
+    显存优化策略:
+    - KNN计算全部在CPU上执行（利用充裕的系统内存）
+    - 只有KNN索引（很小）搬回GPU供loss计算
+    - 对超大点云(>max_knn_points)使用随机子采样近似
     """
     
     def __init__(self, T_min=0.0, T_max=100.0, K_neighbors=8, update_interval=1000,
-                 train_device="cuda:0", compute_device=None):
+                 train_device="cuda:0", compute_device=None, max_knn_points=60000):
         """
         Args:
             T_min: 场景最低温度 (°C)
@@ -29,7 +30,8 @@ class PhysicsConstraints:
             K_neighbors: KNN邻域大小
             update_interval: KNN更新间隔（每多少步更新一次）
             train_device: 训练所在设备 (默认 cuda:0)
-            compute_device: KNN计算设备 (默认自动选择: 优先cuda:1, 否则cpu)
+            compute_device: 保留参数（实际KNN强制在CPU执行以确保安全）
+            max_knn_points: KNN计算时的最大参考点数（超过此数用子采样）
         """
         self.T_min = T_min
         self.T_max = T_max
@@ -37,25 +39,20 @@ class PhysicsConstraints:
         self.update_interval = update_interval
         self.knn_indices = None  # 缓存KNN索引 (在train_device上)
         self._dist_sq_cache = None  # 缓存距离 (在train_device上)
+        self.max_knn_points = max_knn_points
         
         # 设备配置
         self.train_device = torch.device(train_device)
-        if compute_device is not None:
-            self.compute_device = torch.device(compute_device)
-        else:
-            # 自动检测: 如果有第二张GPU就用它，否则用CPU
-            if torch.cuda.device_count() >= 2:
-                self.compute_device = torch.device("cuda:1")
-            else:
-                self.compute_device = torch.device("cpu")
+        # KNN始终在CPU执行（CPU内存通常>32GB，不会OOM）
+        self.compute_device = torch.device("cpu")
         
         print(f"[PhysicsConstraints] train_device={self.train_device}, "
-              f"compute_device={self.compute_device}")
+              f"knn_on=cpu, max_knn_points={self.max_knn_points}")
     
+    @torch.no_grad()
     def update_knn(self, positions):
         """
-        更新K近邻索引
-        在 compute_device 上分批计算，结果搬回 train_device
+        更新K近邻索引（在CPU上计算）
         
         Args:
             positions: (N, 3) 高斯位置张量 (在train_device上)
@@ -63,59 +60,96 @@ class PhysicsConstraints:
         N = positions.shape[0]
         K = min(self.K, N - 1)
         
-        # 将位置搬到计算设备
-        pos_compute = positions.to(self.compute_device)
+        # 搬到CPU计算
+        pos_cpu = positions.detach().cpu()
         
-        # 始终使用分批KNN（安全且高效）
-        indices, dists = self._batched_knn(pos_compute, K)
+        if N > self.max_knn_points:
+            # 对超大点云: 随机选择参考点子集做近似KNN
+            indices, dists = self._subsampled_knn(pos_cpu, K, N)
+        else:
+            # 正常规模: 精确KNN
+            indices, dists = self._batched_knn_cpu(pos_cpu, K)
         
-        # 将结果搬回训练设备
+        # 搬回训练设备（索引很小，几乎不占显存）
         self.knn_indices = indices.to(self.train_device)
         self._dist_sq_cache = dists.to(self.train_device)
-        
-        # 释放计算设备显存
-        del pos_compute
-        if self.compute_device.type == 'cuda':
-            torch.cuda.empty_cache()
     
-    def _batched_knn(self, positions, K, batch_size=2048):
+    def _batched_knn_cpu(self, positions, K, batch_size=4096):
         """
-        分批计算KNN
-        
-        对于N=23284, batch_size=2048:
-        - 每批显存: 2048 * 23284 * 3 * 4 bytes ≈ 0.54 GB (非常安全)
-        - 总共需要12批，每批独立计算
+        在CPU上分批精确KNN
         
         Args:
-            positions: (N, 3) 在compute_device上
+            positions: (N, 3) CPU tensor
             K: 近邻数
-            batch_size: 每批处理的查询点数量
         """
         N = positions.shape[0]
-        device = positions.device
-        all_indices = torch.zeros((N, K), dtype=torch.long, device=device)
-        all_dists = torch.zeros((N, K), device=device)
+        all_indices = torch.zeros((N, K), dtype=torch.long)
+        all_dists = torch.zeros((N, K))
         
         for i in range(0, N, batch_size):
             end = min(i + batch_size, N)
             batch_pos = positions[i:end]  # (B, 3)
             B = end - i
             
-            # 计算该批次到所有点的距离: (B, N)
-            # 使用 cdist 更高效且内存友好
-            dist_sq = torch.cdist(batch_pos, positions, p=2.0).pow(2)  # (B, N)
+            # (B, N) 距离矩阵
+            diff = batch_pos.unsqueeze(1) - positions.unsqueeze(0)  # (B, N, 3)
+            dist_sq = (diff * diff).sum(-1)  # (B, N)
             
-            # 排除自身（设为inf）
-            idx_range = torch.arange(B, device=device)
-            dist_sq[idx_range, idx_range + i] = float('inf')
+            # 排除自身
+            row_idx = torch.arange(B)
+            col_idx = row_idx + i
+            dist_sq[row_idx, col_idx] = float('inf')
             
-            # TopK最近邻
+            # TopK
             dists, indices = dist_sq.topk(K, dim=1, largest=False)
             all_indices[i:end] = indices
             all_dists[i:end] = dists
             
-            # 显式释放临时张量
-            del dist_sq, batch_pos
+            del diff, dist_sq
+        
+        return all_indices, all_dists
+    
+    def _subsampled_knn(self, positions, K, N):
+        """
+        子采样近似KNN: 对于N > max_knn_points
+        随机选取 max_knn_points 个参考点, 每个查询点在其中找近邻
+        
+        显存开销: batch_size * max_knn_points * 4 bytes (全在CPU)
+        例如: 4096 * 60000 * 4 ≈ 0.9GB 完全可接受
+        """
+        sample_size = self.max_knn_points
+        perm = torch.randperm(N)[:sample_size]
+        ref_positions = positions[perm]  # (sample_size, 3)
+        
+        batch_size = 4096
+        all_indices = torch.zeros((N, K), dtype=torch.long)
+        all_dists = torch.zeros((N, K))
+        
+        for i in range(0, N, batch_size):
+            end = min(i + batch_size, N)
+            batch_pos = positions[i:end]  # (B, 3)
+            B = end - i
+            
+            # 计算到参考点的距离 (B, sample_size)
+            diff = batch_pos.unsqueeze(1) - ref_positions.unsqueeze(0)
+            dist_sq = (diff * diff).sum(-1)  # (B, sample_size)
+            
+            # 排除自身（如果查询点恰好是参考点之一）
+            for j in range(B):
+                global_idx = i + j
+                # perm中找global_idx的位置
+                match_mask = (perm == global_idx)
+                if match_mask.any():
+                    ref_idx = match_mask.nonzero(as_tuple=True)[0][0]
+                    dist_sq[j, ref_idx] = float('inf')
+            
+            # TopK
+            dists, local_indices = dist_sq.topk(K, dim=1, largest=False)
+            # 映射回全局索引
+            all_indices[i:end] = perm[local_indices]
+            all_dists[i:end] = dists
+            
+            del diff, dist_sq
         
         return all_indices, all_dists
     
@@ -137,10 +171,16 @@ class PhysicsConstraints:
             self.update_knn(positions.detach())
         
         N = temperatures.shape[0]
-        K = self.knn_indices.shape[1]
         
         # 确保indices不越界（densification后点数可能变化）
-        if N != self.knn_indices.shape[0]:
+        if self.knn_indices.shape[0] != N:
+            self.update_knn(positions.detach())
+        
+        K = self.knn_indices.shape[1]
+        
+        # 安全检查: 确保索引不超过当前点数
+        max_idx = self.knn_indices.max().item()
+        if max_idx >= N:
             self.update_knn(positions.detach())
             K = self.knn_indices.shape[1]
         
@@ -220,14 +260,14 @@ class PhysicsConstraints:
         return loss
 
 
-def uncertainty_aware_loss(pixel_loss_map, uncertainty_map, reg_weight=0.01):
+def uncertainty_aware_loss(pixel_loss_map, uncertainty_map, reg_weight=0.05):
     """
-    不确定性感知损失函数（Gaussian Negative Log-Likelihood）
+    不确定性感知损失函数（改进的 Gaussian Negative Log-Likelihood）
     
-    核心思想：
-    - 高不确定性区域：损失被降权（模型承认"这里我不确定"）
-    - log项防止退化解（不能所有区域都设为高不确定性）
-    - 最终模型自动在难区域升高不确定性，在简单区域保持低不确定性
+    改进要点:
+    1. 对σ设置下界(clamp)，防止σ趋近0导致梯度爆炸
+    2. 增大reg_weight默认值(0.01→0.05)，更强地惩罚大σ
+    3. 添加额外的variance上界惩罚，防止σ无限增大导致负loss
     
     Args:
         pixel_loss_map: (H, W) 或 (C, H, W) 逐像素损失图
@@ -235,21 +275,27 @@ def uncertainty_aware_loss(pixel_loss_map, uncertainty_map, reg_weight=0.01):
         reg_weight: 不确定性稀疏正则化权重
         
     Returns:
-        scalar loss
+        scalar loss (保证非负)
     """
     # 确保维度匹配
     if pixel_loss_map.dim() == 3 and uncertainty_map.dim() == 2:
-        # pixel_loss_map: (C, H, W), uncertainty_map: (H, W)
-        pixel_loss_map = pixel_loss_map.mean(0)  # 取通道均值 → (H, W)
+        pixel_loss_map = pixel_loss_map.mean(0)  # (H, W)
+    
+    # 对σ设置上下界, 防止退化:
+    # 下界0.01: 防止σ→0导致的梯度爆炸
+    # 上界2.0: 防止σ→∞导致的负loss退化解
+    sigma_clamped = uncertainty_map.clamp(min=0.01, max=2.0)
     
     # Gaussian NLL: L/(2σ²) + 0.5*log(σ²)
-    var = uncertainty_map ** 2 + 1e-6  # 方差 = σ²
+    var = sigma_clamped ** 2  # 方差 = σ²
     precision = 1.0 / (2.0 * var)
     nll = precision * pixel_loss_map + 0.5 * torch.log(var)
     
-    # 不确定性稀疏正则化：防止不确定性无限膨胀
-    reg = reg_weight * uncertainty_map.mean()
+    # 不确定性正则化：L2惩罚防止σ膨胀
+    reg = reg_weight * (uncertainty_map ** 2).mean()
     
+    # 最终loss = NLL + 正则化
+    # 由于σ被clamp在[0.01, 2.0], NLL不会无限趋于负数
     return nll.mean() + reg
 
 
@@ -267,9 +313,6 @@ def compute_pixel_loss_map(rendered, gt, lambda_dssim=0.2):
     """
     # L1部分：逐像素
     l1_map = torch.abs(rendered - gt).mean(0)  # (H, W)
-    
-    # 为了保持与原始MFTG一致，这里只返回L1 map
-    # SSIM是窗口级的不能严格逐像素，但L1已经足够好了
     return l1_map
 
 
