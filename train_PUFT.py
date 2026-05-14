@@ -88,7 +88,8 @@ class PUFTConfig:
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, 
-             checkpoint_iterations, checkpoint, debug_from, step, puft_cfg=None):
+             checkpoint_iterations, checkpoint, debug_from, step, puft_cfg=None,
+             train_device="cuda:0", physics_device=None):
     """
     训练函数
     step=1: RGB训练（与原始MFTG相同）
@@ -126,7 +127,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
             T_min=puft_cfg.T_min,
             T_max=puft_cfg.T_max,
             K_neighbors=puft_cfg.K_neighbors,
-            update_interval=puft_cfg.knn_update_interval
+            update_interval=puft_cfg.knn_update_interval,
+            train_device=train_device,
+            compute_device=physics_device
         )
     
     gaussians.training_setup(opt)
@@ -136,7 +139,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    background = torch.tensor(bg_color, dtype=torch.float32, device=train_device)
 
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
@@ -472,6 +475,11 @@ if __name__ == "__main__":
     parser.add_argument("--puft_phase2a_ratio", type=float, default=0.15, help="Phase 2a ratio in Stage 2")
     parser.add_argument("--puft_phase2b_ratio", type=float, default=0.55, help="Phase 2b ratio in Stage 2")
     
+    # === 双GPU配置 ===
+    parser.add_argument("--train_device", type=str, default="cuda:0", help="Main training device (default: cuda:0)")
+    parser.add_argument("--physics_device", type=str, default=None, 
+                        help="Device for physics/KNN computation (default: auto-select cuda:1 if available, else cpu)")
+    
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -515,14 +523,16 @@ if __name__ == "__main__":
     # Stage 1: RGB training (same as MFTG)
     training(lp.extract(args), op.extract(args), pp.extract(args), 
              args.test_iterations, args.save_iterations, args.checkpoint_iterations, 
-             args.start_checkpoint, args.debug_from, step=1, puft_cfg=puft_cfg)
+             args.start_checkpoint, args.debug_from, step=1, puft_cfg=puft_cfg,
+             train_device=args.train_device, physics_device=args.physics_device)
     
     print(f"\033[1;97m●\033[0m Color training complete, preparing PUFT thermal fine-tuning...")
     
     # Stage 2: PUFT thermal fine-tuning
     training(lp.extract(args), opt_args, pp.extract(args),
              args.test_iterations, args.save_iterations, args.checkpoint_iterations,
-             args.start_checkpoint, args.debug_from, step=2, puft_cfg=puft_cfg)
+             args.start_checkpoint, args.debug_from, step=2, puft_cfg=puft_cfg,
+             train_device=args.train_device, physics_device=args.physics_device)
 
     # All done
     print(f"\033[1;32m●\033[0m PUFT Training complete.")

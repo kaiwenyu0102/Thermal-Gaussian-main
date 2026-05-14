@@ -2,6 +2,8 @@
 # PUFT: Physics-guided Uncertainty-aware Fine-Tuning
 # 物理约束与不确定性感知损失函数模块
 #
+# 支持双GPU: 主训练在GPU:0，物理约束计算可在GPU:1或CPU上执行
+#
 
 import torch
 import torch.nn as nn
@@ -12,68 +14,108 @@ class PhysicsConstraints:
     """
     物理引导约束模块
     包含温度空间平滑性约束、温度范围约束和温度-颜色一致性约束
+    
+    双GPU策略:
+    - KNN索引计算（高显存开销）在 compute_device 上执行
+    - 缓存的索引会搬回 train_device 供后续loss计算使用
     """
     
-    def __init__(self, T_min=0.0, T_max=100.0, K_neighbors=8, update_interval=1000):
+    def __init__(self, T_min=0.0, T_max=100.0, K_neighbors=8, update_interval=1000,
+                 train_device="cuda:0", compute_device=None):
         """
         Args:
             T_min: 场景最低温度 (°C)
             T_max: 场景最高温度 (°C)
             K_neighbors: KNN邻域大小
             update_interval: KNN更新间隔（每多少步更新一次）
+            train_device: 训练所在设备 (默认 cuda:0)
+            compute_device: KNN计算设备 (默认自动选择: 优先cuda:1, 否则cpu)
         """
         self.T_min = T_min
         self.T_max = T_max
         self.K = K_neighbors
         self.update_interval = update_interval
-        self.knn_indices = None  # 缓存KNN索引
-        self._dist_sq_cache = None  # 缓存距离
+        self.knn_indices = None  # 缓存KNN索引 (在train_device上)
+        self._dist_sq_cache = None  # 缓存距离 (在train_device上)
+        
+        # 设备配置
+        self.train_device = torch.device(train_device)
+        if compute_device is not None:
+            self.compute_device = torch.device(compute_device)
+        else:
+            # 自动检测: 如果有第二张GPU就用它，否则用CPU
+            if torch.cuda.device_count() >= 2:
+                self.compute_device = torch.device("cuda:1")
+            else:
+                self.compute_device = torch.device("cpu")
+        
+        print(f"[PhysicsConstraints] train_device={self.train_device}, "
+              f"compute_device={self.compute_device}")
     
     def update_knn(self, positions):
         """
         更新K近邻索引
-        使用分批计算避免显存溢出
+        在 compute_device 上分批计算，结果搬回 train_device
         
         Args:
-            positions: (N, 3) 高斯位置张量
+            positions: (N, 3) 高斯位置张量 (在train_device上)
         """
         N = positions.shape[0]
         K = min(self.K, N - 1)
         
-        if N > 50000:
-            # 大规模点云使用分批KNN
-            self.knn_indices, self._dist_sq_cache = self._batched_knn(positions, K)
-        else:
-            # 小规模直接计算
-            # (N, 1, 3) - (1, N, 3) → (N, N) 距离矩阵
-            diff = positions.unsqueeze(1) - positions.unsqueeze(0)
-            dist_sq = (diff ** 2).sum(-1)  # (N, N)
-            # 排除自身（设为inf）
-            dist_sq.fill_diagonal_(float('inf'))
-            # 取最近K个
-            _, self.knn_indices = dist_sq.topk(K, dim=1, largest=False)  # (N, K)
-            # 缓存距离
-            self._dist_sq_cache = torch.gather(dist_sq, 1, self.knn_indices)  # (N, K)
+        # 将位置搬到计算设备
+        pos_compute = positions.to(self.compute_device)
+        
+        # 始终使用分批KNN（安全且高效）
+        indices, dists = self._batched_knn(pos_compute, K)
+        
+        # 将结果搬回训练设备
+        self.knn_indices = indices.to(self.train_device)
+        self._dist_sq_cache = dists.to(self.train_device)
+        
+        # 释放计算设备显存
+        del pos_compute
+        if self.compute_device.type == 'cuda':
+            torch.cuda.empty_cache()
     
-    def _batched_knn(self, positions, K, batch_size=10000):
-        """分批计算KNN，适用于大规模点云"""
+    def _batched_knn(self, positions, K, batch_size=2048):
+        """
+        分批计算KNN
+        
+        对于N=23284, batch_size=2048:
+        - 每批显存: 2048 * 23284 * 3 * 4 bytes ≈ 0.54 GB (非常安全)
+        - 总共需要12批，每批独立计算
+        
+        Args:
+            positions: (N, 3) 在compute_device上
+            K: 近邻数
+            batch_size: 每批处理的查询点数量
+        """
         N = positions.shape[0]
-        all_indices = torch.zeros((N, K), dtype=torch.long, device=positions.device)
-        all_dists = torch.zeros((N, K), device=positions.device)
+        device = positions.device
+        all_indices = torch.zeros((N, K), dtype=torch.long, device=device)
+        all_dists = torch.zeros((N, K), device=device)
         
         for i in range(0, N, batch_size):
             end = min(i + batch_size, N)
             batch_pos = positions[i:end]  # (B, 3)
-            # 计算该批次到所有点的距离
-            diff = batch_pos.unsqueeze(1) - positions.unsqueeze(0)  # (B, N, 3)
-            dist_sq = (diff ** 2).sum(-1)  # (B, N)
-            # 排除自身
-            for j in range(end - i):
-                dist_sq[j, i + j] = float('inf')
-            # TopK
+            B = end - i
+            
+            # 计算该批次到所有点的距离: (B, N)
+            # 使用 cdist 更高效且内存友好
+            dist_sq = torch.cdist(batch_pos, positions, p=2.0).pow(2)  # (B, N)
+            
+            # 排除自身（设为inf）
+            idx_range = torch.arange(B, device=device)
+            dist_sq[idx_range, idx_range + i] = float('inf')
+            
+            # TopK最近邻
             dists, indices = dist_sq.topk(K, dim=1, largest=False)
             all_indices[i:end] = indices
             all_dists[i:end] = dists
+            
+            # 显式释放临时张量
+            del dist_sq, batch_pos
         
         return all_indices, all_dists
     
