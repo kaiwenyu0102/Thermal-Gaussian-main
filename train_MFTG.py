@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import logging
 import os
 import torch
 import time
@@ -33,6 +34,7 @@ except ImportError:
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, step):
+    logging.info(f"\u25CB dataset:{dataset.name}, opt:{opt}, pipe:{pipe}, step:{step}, debug_from:{debug_from}, set:{step}\n")
     
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -255,7 +257,7 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
-    print("Optimizing " + args.model_path)
+    print(f"\u25CF Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
@@ -264,9 +266,9 @@ if __name__ == "__main__":
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,1)
-    print("color training complete,prepare to training thermal pictures")
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,2)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, 1)
+    print(f"\033[1;97m\u25CF\033[0m color training complete,prepare to training thermal pictures")
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, 2)
 
     # All done
-    print("\nTraining complete.")
+    print(f"\033[1;32m\u25CF\033[0m Training complete.")

@@ -20,15 +20,15 @@ from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
 class Scene_1:
 
-    gaussians : GaussianModel
+    gaussians : GaussianModel # ← 声明：本类有个属性叫 gaussians，类型是 GaussianModel, PEP 526 的"类型注解声明"
 
     def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
-        """b
+        """
         :param path: Path to colmap scene main folder.
         """
         self.model_path = args.model_path
         self.loaded_iter = None
-        self.gaussians = gaussians
+        self.gaussians = gaussians # ← 真正赋值
 
         if load_iteration:
             if load_iteration == -1:

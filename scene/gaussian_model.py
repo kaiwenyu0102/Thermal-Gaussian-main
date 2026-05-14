@@ -42,20 +42,26 @@ class GaussianModel:
 
 
     def __init__(self, sh_degree : int):
-        self.active_sh_degree = 0
-        self.max_sh_degree = sh_degree  
-        self._xyz = torch.empty(0)
-        self._features_dc = torch.empty(0)
-        self._features_rest = torch.empty(0)
-        self._scaling = torch.empty(0)
-        self._rotation = torch.empty(0)
-        self._opacity = torch.empty(0)
-        self.max_radii2D = torch.empty(0)
-        self.xyz_gradient_accum = torch.empty(0)
-        self.denom = torch.empty(0)
+        self.active_sh_degree = 0                   # 当前激活的SH阶数
+        self.max_sh_degree = sh_degree              # 最大SH阶数
+        self._xyz = torch.empty(0)                  # 点云坐标
+        self._features_dc = torch.empty(0)          # 直接特征
+        self._features_rest = torch.empty(0)        # 剩余特征
+        self._scaling = torch.empty(0)              # 缩放参数
+        self._rotation = torch.empty(0)             # 旋转参数
+        self._opacity = torch.empty(0)              # 不透明度
+        self.max_radii2D = torch.empty(0)           # 每个高斯在图像上的最大投影半径
+        self.xyz_gradient_accum = torch.empty(0)    # xyz梯度累加
+        self.denom = torch.empty(0)                 # 累积次数（作为除数）
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        # === PUFT: 新增属性 ===
+        self._uncertainty = torch.empty(0)          # σ_i: 每个高斯的不确定性(内部参数，经softplus激活)
+        self._temperature = torch.empty(0)          # T_i: 每个高斯的物理温度(内部参数)
+        self.puft_enabled = False                   # PUFT模式开关
+        self.T_min = 0.0                            # 场景最低温度
+        self.T_max = 100.0                          # 场景最高温度
         self.setup_functions()
 
     def capture(self):
@@ -117,6 +123,38 @@ class GaussianModel:
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
+    # === PUFT: 新增属性访问器 ===
+    @property
+    def get_uncertainty(self):
+        """获取不确定性值，通过softplus激活确保正值"""
+        if self._uncertainty.shape[0] == 0:
+            return torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        return torch.nn.functional.softplus(self._uncertainty)
+    
+    @property
+    def get_temperature(self):
+        """获取物理温度值，通过sigmoid映射到[T_min, T_max]"""
+        if self._temperature.shape[0] == 0:
+            return torch.ones((self.get_xyz.shape[0], 1), device="cuda") * ((self.T_min + self.T_max) / 2.0)
+        return torch.sigmoid(self._temperature) * (self.T_max - self.T_min) + self.T_min
+
+    def init_puft_attributes(self, T_min=0.0, T_max=100.0):
+        """初始化PUFT属性（在Stage 2开始时调用）"""
+        num_points = self.get_xyz.shape[0]
+        self.puft_enabled = True
+        self.T_min = T_min
+        self.T_max = T_max
+        # 不确定性初始化为0（softplus(0) ≈ 0.693）
+        self._uncertainty = nn.Parameter(
+            torch.zeros((num_points, 1), dtype=torch.float, device="cuda").requires_grad_(True)
+        )
+        # 温度初始化为0（sigmoid(0)=0.5 → 映射到温度范围中点）
+        self._temperature = nn.Parameter(
+            torch.zeros((num_points, 1), dtype=torch.float, device="cuda").requires_grad_(True)
+        )
+        print(f"[PUFT] Initialized uncertainty and temperature for {num_points} Gaussians")
+        print(f"[PUFT] Temperature range: [{T_min}, {T_max}]")
+
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
@@ -145,6 +183,9 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # PUFT: 预分配（此时不启用优化，仅占位）
+        self._uncertainty = torch.zeros((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
+        self._temperature = torch.zeros((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -159,6 +200,13 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
+
+        # === PUFT: 如果PUFT已启用，添加不确定性和温度的优化参数 ===
+        if self.puft_enabled and isinstance(self._uncertainty, nn.Parameter):
+            uncertainty_lr = getattr(training_args, 'uncertainty_lr', 0.005)
+            temperature_lr = getattr(training_args, 'temperature_lr', 0.01)
+            l.append({'params': [self._uncertainty], 'lr': uncertainty_lr, "name": "uncertainty"})
+            l.append({'params': [self._temperature], 'lr': temperature_lr, "name": "temperature"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -299,6 +347,11 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        # === PUFT: 剪枝不确定性和温度 ===
+        if self.puft_enabled and "uncertainty" in optimizable_tensors:
+            self._uncertainty = optimizable_tensors["uncertainty"]
+            self._temperature = optimizable_tensors["temperature"]
+
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
@@ -326,13 +379,22 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_uncertainty=None, new_temperature=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
         "rotation" : new_rotation}
+
+        # === PUFT: 添加不确定性和温度到优化器 ===
+        if self.puft_enabled and isinstance(self._uncertainty, nn.Parameter):
+            if new_uncertainty is None:
+                new_uncertainty = torch.zeros((new_xyz.shape[0], 1), device="cuda")
+            if new_temperature is None:
+                new_temperature = torch.zeros((new_xyz.shape[0], 1), device="cuda")
+            d["uncertainty"] = new_uncertainty
+            d["temperature"] = new_temperature
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -341,6 +403,11 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+
+        # === PUFT: 更新不确定性和温度 ===
+        if self.puft_enabled and "uncertainty" in optimizable_tensors:
+            self._uncertainty = optimizable_tensors["uncertainty"]
+            self._temperature = optimizable_tensors["temperature"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -355,6 +422,15 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
+        # === PUFT: 不确定性引导的额外分裂条件 ===
+        if self.puft_enabled and isinstance(self._uncertainty, nn.Parameter):
+            uncertainty_vals = self.get_uncertainty.squeeze()
+            # 高不确定性+大尺度的高斯也应该被分裂
+            high_uncertainty_mask = uncertainty_vals > 1.5  # 阈值可调
+            big_enough_mask = torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent
+            uncertainty_split_mask = torch.logical_and(high_uncertainty_mask, big_enough_mask)
+            selected_pts_mask = torch.logical_or(selected_pts_mask, uncertainty_split_mask)
+
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
@@ -366,7 +442,15 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        # === PUFT: 分裂后继承不确定性（减半）和温度 ===
+        new_uncertainty = None
+        new_temperature = None
+        if self.puft_enabled and isinstance(self._uncertainty, nn.Parameter):
+            # 子高斯继承父高斯不确定性的一半（softplus前的值减去ln2）
+            new_uncertainty = self._uncertainty[selected_pts_mask].repeat(N, 1) - 0.35
+            new_temperature = self._temperature[selected_pts_mask].repeat(N, 1)
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_uncertainty, new_temperature)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -377,6 +461,15 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
+        # === PUFT: 不确定性引导的额外克隆条件 ===
+        if self.puft_enabled and isinstance(self._uncertainty, nn.Parameter):
+            uncertainty_vals = self.get_uncertainty.squeeze()
+            # 高不确定性+小尺度的高斯应该被克隆
+            high_uncertainty_mask = uncertainty_vals > 1.5
+            small_enough_mask = torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent
+            uncertainty_clone_mask = torch.logical_and(high_uncertainty_mask, small_enough_mask)
+            selected_pts_mask = torch.logical_or(selected_pts_mask, uncertainty_clone_mask)
+
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
@@ -384,7 +477,14 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        # === PUFT: 克隆继承不确定性和温度 ===
+        new_uncertainty = None
+        new_temperature = None
+        if self.puft_enabled and isinstance(self._uncertainty, nn.Parameter):
+            new_uncertainty = self._uncertainty[selected_pts_mask]
+            new_temperature = self._temperature[selected_pts_mask]
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_uncertainty, new_temperature)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
